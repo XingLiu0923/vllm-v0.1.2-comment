@@ -234,15 +234,20 @@ class SequenceGroup:
 
 class SequenceGroupMetadata:
     """Metadata for a sequence group. Used to create `InputMetadata`.
-
+    SequenceGroupMetadata是为Running状态的序列组创建的
 
     Args:
         request_id: The ID of the request.
         is_prompt: Whether the request is at prompt stage.
+                    组是否从waiting状态变为running状态。
+                    当没有KV Cache时，必须使用提示来计算KV Cache，并且该值用于确定模型中是否包含提示标记。
         seq_data: The sequence data. (Seq id -> sequence data)
+                    对于组中的所有序列，以ID为key、以ID对应的token为value的映射表
         sampling_params: The sampling parameters used to generate the outputs.
+                    用于采样的参数。包括top_k 、 top_p等
         block_tables: The block tables. (Seq id -> list of physical block
             numbers)
+                    映射序列组中每个序列对应的物理块列表的表。
     """
 
     def __init__(

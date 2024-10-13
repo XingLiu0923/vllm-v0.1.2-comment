@@ -141,18 +141,32 @@ class CacheEngine:
 
     @staticmethod
     def get_cache_block_size(
-        block_size: int,
+        block_size: int,    # 块内包含的元素数量，也就是我们要处理的序列长度
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
     ) -> int:
+        # 在MHA中，获取每个头的维度
+        # 隐藏层大小（即词嵌入的维度或者自注意力机制的输出维度）是 768
+        # 同时它使用了12个注意力头（attention heads）进行多头注意力机制（Multi-head Attention）
+        # head_size = 768/12 = 64
         head_size = model_config.get_head_size()
+        # 获取头的数量，并除以Tensor Parallel的值（Parallel是Megatron LM的参数）
+        # num_heads = 12 / 3 = 4
         num_heads = model_config.get_num_heads(parallel_config)
+        # 获取总的层次数量，并除以Pipeline Parallel的值（Parallel是Megatron LM的参数）
+        # num_layers = 6 / 3 = 2
         num_layers = model_config.get_num_layers(parallel_config)
 
+        # 计算块内包含的元素数量（block_size）乘以每个元素包含的参数数量
+        # key_cache_block = 1024 * 4 * 64 = 256kB
         key_cache_block = block_size * num_heads * head_size
+        # value_cache_block = 256kB
         value_cache_block = key_cache_block
+        # total = 2 * (256 + 256) = 1MB
         total = num_layers * (key_cache_block + value_cache_block)
         dtype_size = _get_dtype_size(model_config.dtype)
+
+        # 缓存块大小 = 数据类型大小 * 总数
         return dtype_size * total
 
 

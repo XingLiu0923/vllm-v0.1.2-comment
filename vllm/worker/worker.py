@@ -1,5 +1,5 @@
 """A GPU worker class."""
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
 
@@ -53,7 +53,7 @@ class Worker:
         # self.init_cache_engine().
         self.cache_config = None
         self.block_size = None
-        self.cache_engine = None
+        self.cache_engine: Optional[CacheEngine] = None
         self.cache_events = None
         self.gpu_cache = None
 
@@ -107,8 +107,12 @@ class Worker:
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
         torch.cuda.synchronize()
+        # 上面进行了forward，就可以得到forward所需要的内存
+        # 当我们计算可用于存储缓存块的内存量时，需要从总的GPU内存中减去这部分峰值内存使用量。
+        # 这样，我们就可以确保在分配缓存块时，不会超过GPU的内存限制，也不会影响模型的正常运行。
         peak_memory = torch.cuda.max_memory_allocated()
         total_gpu_memory = get_gpu_memory()
+        # cache_block_size 大小是指PagedAttention使用的block实际占用的内存大小
         cache_block_size = CacheEngine.get_cache_block_size(
             block_size, self.model_config, self.parallel_config)
         num_gpu_blocks = int(
@@ -144,6 +148,7 @@ class Worker:
         # Add prompt tokens.
         prompt_lens: List[int] = []
         for seq_group_metadata in seq_group_metadata_list:
+            # 仅对刚刚从“等待”状态更改为“运行”状态的 SequenceGroup 输入提示标记。
             if not seq_group_metadata.is_prompt:
                 continue
 
@@ -159,7 +164,9 @@ class Worker:
             prompt_len = len(prompt_tokens)
             prompt_lens.append(prompt_len)
 
+            # 获取属于 SequenceGroup 的所有 Sequence token 并将它们展开到input_tokens变量中
             input_tokens.extend(prompt_tokens)
+            # 在input_positions中放入位置信息数组作为提示大小
             # NOTE(woosuk): Here we assume that the first token in the prompt
             # is always the first token in the sequence.
             input_positions.extend(range(len(prompt_tokens)))
@@ -171,6 +178,7 @@ class Worker:
                 continue
 
             # Compute the slot mapping.
+            # 创建一个槽位映射表来确定每个令牌ID被分配到哪个槽位。 （ slot_mapping ）
             block_table = seq_group_metadata.block_tables[seq_id]
             for i in range(prompt_len):
                 block_number = block_table[i // self.block_size]
@@ -192,7 +200,11 @@ class Worker:
             seq_groups.append((seq_ids, sampling_params))
 
             for seq_id in seq_ids:
+                # 添加生成标记，每个序列一个。
+                # token ID为提示中的最后一个token ID
+                # 该token对应的block和slot是调度器为所有处于Running状态的SequenceGroup预先分配的。
                 seq_data = seq_group_metadata.seq_data[seq_id]
+                # 为什么只插入last_token??
                 generation_token = seq_data.get_last_token_id()
                 input_tokens.append(generation_token)
 
@@ -270,6 +282,7 @@ class Worker:
             cache_events = None
 
         # If there is no input, we don't need to execute the model.
+        # 等待swap的io完成
         if not seq_group_metadata_list:
             if cache_events is not None:
                 for event in cache_events:

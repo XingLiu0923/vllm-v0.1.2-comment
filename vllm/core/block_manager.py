@@ -71,10 +71,21 @@ class BlockSpaceManager:
         assert watermark >= 0.0
 
         self.watermark_blocks = int(watermark * num_gpu_blocks)
+
+        # 使用之前计算的GPU 和 CPU 内可用的最大块数来初始化管理器。
+        # 此时使用的类使用BlockAllocator ，它执行以下角色。
+        # - 未分配块管理
+        # - 块分配和释放
+        # - Reference Count 관리 引用计数管理
+        # - 序列逻辑块与物理块之间的映射表管理 (BlockTable)
+        # 引用计数是指使用特定块的序列数
+        # 如果该序列的块位于 GPU 上，则块表包含 GPU 块
+        # 如果该序列的块被换出并位于 CPU 上，则块表包含 CPU 块。
         self.gpu_allocator = BlockAllocator(Device.GPU, block_size,
                                             num_gpu_blocks)
         self.cpu_allocator = BlockAllocator(Device.CPU, block_size,
                                             num_cpu_blocks)
+
         # Mapping: seq_id -> BlockTable.
         self.block_tables: Dict[int, BlockTable] = {}
 
@@ -95,9 +106,13 @@ class BlockSpaceManager:
 
         # Allocate new physical token blocks that will store the prompt tokens.
         block_table: BlockTable = []
+        # seq 内部的是逻辑块
+        # allocate 的是物理块
+        # 下面for循环可以看到一个seq_group里的多个逻辑块对应一个物理块
         for _ in range(len(seq.logical_token_blocks)):
             block = self.gpu_allocator.allocate()
             # Set the reference counts of the token blocks.
+            # 因为所有的 prompt tokens 都是共享的，所以引用计数初始化为序列组内的所有序列数量
             block.ref_count = seq_group.num_seqs()
             block_table.append(block)
 
@@ -108,6 +123,7 @@ class BlockSpaceManager:
     def can_append_slot(self, seq_group: SequenceGroup) -> bool:
         # Simple heuristic: If there is at least one free block
         # for each sequence, we can append.
+        # 感觉很保险
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
         num_seqs = seq_group.num_seqs(status=SequenceStatus.RUNNING)
         return num_seqs <= num_free_gpu_blocks
@@ -117,9 +133,13 @@ class BlockSpaceManager:
         logical_blocks = seq.logical_token_blocks
         block_table = self.block_tables[seq.seq_id]
 
+        # 通过判断seq的逻辑block和分配的物理block是否一致来判断要不要分配新的物理块
+        # 所以顺序应该是，生成token->逻辑block->物理block
         if len(block_table) < len(logical_blocks):
             # The sequence has a new logical block.
             # Allocate a new physical block.
+            # 如果SequenceGroup中的逻辑块数量大于块管理器在SequenceGroup的块表中管理的块数量
+            # 那么这意味着已经为新的令牌分配了新的逻辑块，因此会分配新的物理块并将其存储在块表中
             block = self.gpu_allocator.allocate()
             block_table.append(block)
             return None
@@ -166,6 +186,7 @@ class BlockSpaceManager:
         # NOTE: Conservatively, we assume that every sequence will allocate
         # at least one free block right after the swap-in.
         # NOTE: This should match the logic in can_append_slot().
+        # num_swapped_seqs 代表给swapped进来的seq多分配一个slot
         num_required_blocks = len(blocks) + num_swapped_seqs
         return num_free_blocks - num_required_blocks >= self.watermark_blocks
 
@@ -207,6 +228,9 @@ class BlockSpaceManager:
             if seq.is_finished():
                 continue
             new_block_table: BlockTable = []
+
+            # seq_id 对应的 block list
+            # block_table 实际是一个 list!
             block_table = self.block_tables[seq.seq_id]
 
             for gpu_block in block_table:

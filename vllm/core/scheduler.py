@@ -62,6 +62,7 @@ class Scheduler:
         # Instantiate the scheduling policy.
         self.policy = PolicyFactory.get_policy(policy_name="fcfs")
         # Create the block space manager.
+        # 这里的 num_gpu_blocks 和 num_cpu_blocks 是 _init_cache() 算出来的
         self.block_manager = BlockSpaceManager(
             block_size=self.cache_config.block_size,
             num_gpu_blocks=self.cache_config.num_gpu_blocks,
@@ -104,8 +105,11 @@ class Scheduler:
     def _schedule(
             self) -> Tuple[SchedulerOutputs, List[str], List[SequenceGroup]]:
         # Blocks that need to be swaped or copied before model execution.
+        # 当处于 Swapped 状态的组返回到 Running 状态并需要继续处理时，CPU ↔ GPU 之间交换的块映射表。
         blocks_to_swap_in: Dict[int, int] = {}
+        # GPU ↔ CPU之间的块表，用于将组从运行状态换出到交换状态。
         blocks_to_swap_out: Dict[int, int] = {}
+        # 块对列表，用于将 GPU 中的块复制到另一个位置。
         blocks_to_copy: Dict[int, List[int]] = {}
         ignored_seq_groups: List[SequenceGroup] = []
 
@@ -118,17 +122,27 @@ class Scheduler:
         # the sequence groups in the RUNNING state.
         # In this case, the policy is responsible for deciding which sequence
         # groups to preempt.
+        # 调度的第一步是检查当前运行的SequenceGroup（处于Running状态）中是否可以按优先级最高的顺序分配时隙slot
+        # 随着令牌逐一生成，所需内存不断增加
+        # 如果高优先级 SequenceGroup 所需内存不足
+        # 则将低优先级 SequenceGroup 的槽位从 GPU 内存中下移。
         self.running = self.policy.sort_by_priority(now, self.running)
 
         # Reserve new token slots for the running sequence groups.
         running: List[SequenceGroup] = []
         preempted: List[SequenceGroup] = []
         while self.running:
+            # 弹出运行状态下优先级最高的SequenceGroup。 (=GroupA)
             seq_group = self.running.pop(0)
+            # 看是否能为group中running的sequence分配slot
+            # 结果就是保证能为所有running的group的sequence分配slot
             while not self.block_manager.can_append_slot(seq_group):
+                # 如果您无法为该组分配缓存块槽，请重复以下过程。
                 if self.running:
                     # Preempt the lowest-priority sequence groups.
+                    # 在运行状态的组中选择优先级最低的组 (=GroupB)
                     victim_seq_group = self.running.pop(-1)
+                    # 抢占所选组 (GroupB)
                     self._preempt(victim_seq_group, blocks_to_swap_out)
                     preempted.append(victim_seq_group)
                 else:
@@ -139,12 +153,15 @@ class Scheduler:
                     break
             else:
                 # Append new slots to the sequence group.
+                # 将当前组（GroupA）添加到运行状态
                 self._append_slot(seq_group, blocks_to_copy)
                 running.append(seq_group)
         self.running = running
 
         # Swap in the sequence groups in the SWAPPED state if possible.
+        # 这是为了重新加载因高优先级 SequenceGroup 创建已完成并且 GPU 内存空间已空闲而被踢出的组
         self.swapped = self.policy.sort_by_priority(now, self.swapped)
+        # 注意，blocks_to_swap_out为空，不得有任何组被安排换出。
         while self.swapped and not blocks_to_swap_out:
             seq_group = self.swapped[0]
             # If the sequence group has been preempted in this step, stop.
@@ -280,11 +297,13 @@ class Scheduler:
                List[SequenceGroup]]:
         # Schedule sequence groups.
         # This function call changes the internal states of the scheduler
+
         # such as self.running, self.swapped, and self.waiting.
         (scheduler_outputs, prompt_group_ids,
          ignored_seq_groups) = self._schedule()
 
         # Create input data structures.
+        # SequenceGroupMetadata是为Running状态的序列组创建的
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
         for seq_group in self.running:
             is_prompt = seq_group.request_id in prompt_group_ids
@@ -357,6 +376,7 @@ class Scheduler:
             ret = self.block_manager.append_slot(seq)
             if ret is not None:
                 src_block, dst_block = ret
+                # 出现了cow的块，需要进行复制
                 if src_block in blocks_to_copy:
                     blocks_to_copy[src_block].append(dst_block)
                 else:
@@ -380,14 +400,20 @@ class Scheduler:
         # TODO(woosuk): Support recomputation for sequence groups with multiple
         # sequences. This may require a more sophisticated CUDA kernel.
         if preemption_mode is None:
+            # 查找 SequenceGroup 内尚未完成创建的 Sequences 的数量。
             seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
             if len(seqs) == 1:
+                # 如果该值为1，则对应序列组中的所有KVCache都被释放并转为等待状态
+                # 比swap的成本小
                 preemption_mode = PreemptionMode.RECOMPUTE
             else:
                 preemption_mode = PreemptionMode.SWAP
         if preemption_mode == PreemptionMode.RECOMPUTE:
+            # 这个seq_group的所有seq变成waiting，通过block_manager释放内存
             self._preempt_by_recompute(seq_group)
         elif preemption_mode == PreemptionMode.SWAP:
+            # swap KVCache 内存。
+            # 计划换出的KV Cache组块存储在blocks_to_swap_out变量中。
             self._preempt_by_swap(seq_group, blocks_to_swap_out)
         else:
             assert False, "Invalid preemption mode."
@@ -410,6 +436,7 @@ class Scheduler:
         seq_group: SequenceGroup,
         blocks_to_swap_out: Dict[int, int],
     ) -> None:
+        # running 状态都变成 SWAPPED
         seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
         for seq in seqs:
             seq.status = SequenceStatus.SWAPPED
@@ -437,6 +464,8 @@ class Scheduler:
             raise RuntimeError(
                 "Aborted due to the lack of CPU swap space. Please increase "
                 "the swap space to avoid this error.")
+        # gpu_block.block_number: cpu_block.block_number
+        # 用于将组从运行状态换出到交换状态
         mapping = self.block_manager.swap_out(seq_group)
         blocks_to_swap_out.update(mapping)
         for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):

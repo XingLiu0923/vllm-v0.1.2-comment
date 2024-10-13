@@ -87,6 +87,7 @@ class ModelConfig:
 
     def get_head_size(self) -> int:
         # FIXME(woosuk): This may not be true for all models.
+        # hidden_size 词嵌入的维度或者自注意力机制的输出维度
         return self.hf_config.hidden_size // self.hf_config.num_attention_heads
 
     def get_num_heads(self, parallel_config: "ParallelConfig") -> int:
@@ -114,6 +115,7 @@ class CacheConfig:
         gpu_memory_utilization: float,
         swap_space: int,
     ) -> None:
+        # block_size 是每个 block 中有多少 token 信息
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.swap_space_bytes = swap_space * _GB

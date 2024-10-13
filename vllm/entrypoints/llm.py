@@ -122,6 +122,11 @@ class LLM:
                 token_ids = None
             else:
                 token_ids = prompt_token_ids[i]
+            # 为了生成句子，我们将请求的提示添加到队列中
+            # 此时，我们会复制SamplingParams中指定的best_of数量的序列并存储到队列中
+            # 每个提示都会被创建为一个Sequence对象，并将一个请求（即提示）的best_of个副本复制，组成SequenceGroup对象
+            # （sequenceGroup中的prompt token 都是相同的）
+            # 最后添加到scheduler的等待队列中。
             self._add_request(prompt, sampling_params, token_ids)
         return self._run_engine(use_tqdm)
 

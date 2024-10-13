@@ -156,6 +156,7 @@ class PagedAttention(nn.Module):
         """
 
         # Reshape the query, key, and value tensors.
+        # [num_tokens, num_heads, head_size]
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_heads, self.head_size)
         value = value.view(-1, self.num_heads, self.head_size)

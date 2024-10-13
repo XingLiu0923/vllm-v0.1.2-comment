@@ -238,7 +238,12 @@ class LLMEngine:
             # Nothing to do.
             return []
 
+        # 调度程序确定哪些块应该换入/换出，哪些块应该被复制 (blocks_to_copy)
+        # 以及哪些SequenceGroup应该转发到模型 (running <=> seq_group_metadata_list)
+        # 然而，到目前为止，实际 GPU 和 CPU 内存之间没有发生数据移动
+        # 由于这只是关于需要移动哪些数据， _run_workers 里的 CacheEngine 组件用于实际移动数据。
         # Execute the model.
+        # 指示模型进行前向传播
         output = self._run_workers(
             "execute_model",
             seq_group_metadata_list=seq_group_metadata_list,
